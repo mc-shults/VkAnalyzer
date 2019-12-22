@@ -4,17 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"os/exec"
-	"os/signal"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // Config - program config
@@ -38,6 +36,8 @@ type Post struct {
 	ID          interface{} `bson:"_id"`
 	Attachments []Attachment
 }
+
+var dbPosts *mongo.Collection
 
 func (post Post) getPhotos() []Photo {
 	var photos []Photo
@@ -86,68 +86,102 @@ func setIsBike(id interface{}, dbPosts *mongo.Collection, isBike bool) {
 	dbPosts.UpdateOne(context.TODO(), filter, update)
 }
 
-func downloadFile(url string, filepath string) error {
-	out, err := os.Create(filepath)
-	if err != nil {
-		return err
+func analysePhoto(connection *websocket.Conn, url string) (result bool, err bool) {
+	result = false
+	err = true
+	errInfo := connection.WriteMessage(1, []byte(url))
+	if errInfo != nil {
+		log.Println("analyse url write error:", errInfo)
+		return
 	}
-	defer out.Close()
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
+
+	_, message, errInfo := connection.ReadMessage()
+	if errInfo != nil {
+		log.Println("Analyse result read error:", errInfo)
+		return
 	}
-	defer resp.Body.Close()
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		return err
-	}
-	return nil
+	result = string(message) == "1"
+	err = false
+	return
 }
 
-func readResult(filename string) bool {
-	dat, err := ioutil.ReadFile(filename)
-	check(err)
-	return string(dat) == "1"
+func analyzePhotos(connection *websocket.Conn, photos []Photo) (result bool, err bool) {
+
+	for _, photo := range photos {
+		result, err = analysePhoto(connection, photo.Photo130)
+		if err {
+			return
+		} else if !result {
+			return
+		}
+	}
+	return true, false
 }
 
-func analysePhoto(url string) bool {
-	err := downloadFile(url, "image.jpg")
-	if err != nil {
+func processPost(connection *websocket.Conn, post Post) (err bool) {
+	photos := post.getPhotos()
+	if len(photos) == 0 {
+		setIsBike(post.ID, dbPosts, false)
 		return false
 	}
-	cmd := exec.Command(`c:\Users\dmitr\AppData\Local\Programs\Python\Python36\python.exe`, "predict.py")
-	cmd.Run()
-	return readResult("result")
+	isBike, connErr := analyzePhotos(connection, photos)
+	if connErr {
+		return true
+	}
+	setIsBike(post.ID, dbPosts, isBike)
+	return false
 }
 
-func work(done *chan struct{}, dbPosts *mongo.Collection) {
+func waitForRequest(connection *websocket.Conn) (err bool) {
+	_, message, errInfo := connection.ReadMessage()
+	if errInfo != nil {
+		log.Println("Read error:", errInfo)
+		return true
+	} else if string(message) != "get" {
+		connection.WriteMessage(1, []byte("Invalid request"))
+		return true
+	}
+	return false
+}
+
+func endProcessPost(connection *websocket.Conn, postID interface{}) (err bool) {
+	fmt.Println("End:", postID)
+	errInfo := connection.WriteMessage(1, []byte("end"))
+
+	if errInfo != nil {
+		log.Println("write:", err)
+		return true
+	}
+	return false
+}
+
+func work(connection *websocket.Conn) {
 	for {
+		if waitForRequest(connection) {
+			break
+		}
 		post := getUnprocessedPost(dbPosts)
-		photos := post.getPhotos()
-		if len(photos) == 0 {
-			setIsBike(post.ID, dbPosts, false)
-			continue
+		if processPost(connection, post) {
+			break
 		}
-		isBike := false
-		for _, photo := range photos {
-			isBike = isBike || analysePhoto(photo.Photo130)
+		if endProcessPost(connection, post.ID) {
+			break
 		}
-		setIsBike(post.ID, dbPosts, isBike)
 	}
 }
 
-func waitEnd(done *chan struct{}) {
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-	select {
-	case <-interrupt:
-		fmt.Println("interrupt")
-		select {
-		case <-*done:
-		case <-time.After(time.Second):
-		}
-	case <-*done:
+func server(w http.ResponseWriter, r *http.Request) {
+	var upgrader = websocket.Upgrader{}
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		return true
 	}
+	connection, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Print("upgrade:", err)
+		return
+	}
+	defer connection.Close()
+	work(connection)
 }
 
 func connectMongo(mongoURL string) *mongo.Client {
@@ -169,13 +203,9 @@ func connectMongo(mongoURL string) *mongo.Client {
 
 func main() {
 	conf := initConfig("config.json")
-
 	db := connectMongo(conf.MongoURL)
-	dbPosts := db.Database("big_data").Collection("posts")
+	dbPosts = db.Database("big_data").Collection("posts")
 	defer db.Disconnect(context.TODO())
-
-	done := make(chan struct{})
-	defer close(done)
-	go work(&done, dbPosts)
-	waitEnd(&done)
+	http.HandleFunc("/", server)
+	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
