@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -37,7 +38,12 @@ type Post struct {
 	Attachments []Attachment
 }
 
-var dbPosts *mongo.Collection
+type safeCollection struct {
+	sync.Mutex
+	collection *mongo.Collection
+}
+
+var dbPosts safeCollection
 
 func (post Post) getPhotos() []Photo {
 	var photos []Photo
@@ -64,26 +70,40 @@ func initConfig(filename string) Config {
 	return conf
 }
 
-func getUnprocessedPost(dbPosts *mongo.Collection) Post {
+func getUnprocessedPost() Post {
 	for {
+		now := time.Now().Unix()
 		exists := bson.D{{Key: "$exists", Value: true}}
 		notExists := bson.D{{Key: "$exists", Value: false}}
-		filter := bson.D{{Key: "attachments.0", Value: exists}, {Key: "is_bike", Value: notExists}}
+		notBegin := bson.D{{Key: "process_begin", Value: notExists}}
+		olderHour := bson.D{{Key: "$lt", Value: now - 60*60}}
+		oldBegin := bson.D{{Key: "process_begin", Value: olderHour}}
+		filter := bson.D{{Key: "attachments.0", Value: exists}, {Key: "is_bike", Value: notExists}, {Key: "$or", Value: []bson.D{notBegin, oldBegin}}}
 		var post Post
-		err := dbPosts.FindOne(context.TODO(), filter).Decode(&post)
+
+		dbPosts.Lock()
+		defer dbPosts.Unlock()
+		err := dbPosts.collection.FindOne(context.TODO(), filter).Decode(&post)
 		if err != nil {
 			time.Sleep(time.Second)
 			continue
 		}
+
+		updateFilter := bson.D{{Key: "_id", Value: post.ID}}
+		update := bson.M{
+			"$set": bson.M{"process_begin": now},
+		}
+		dbPosts.collection.UpdateOne(context.TODO(), updateFilter, update)
+
 		return post
 	}
 }
 
-func setIsBike(id interface{}, dbPosts *mongo.Collection, isBike bool) {
+func setIsBike(id interface{}, isBike bool) {
 	filter := bson.D{{Key: "_id", Value: id}}
 	transportType := bson.D{{Key: "is_bike", Value: isBike}}
 	update := bson.D{{Key: "$set", Value: transportType}}
-	dbPosts.UpdateOne(context.TODO(), filter, update)
+	dbPosts.collection.UpdateOne(context.TODO(), filter, update)
 }
 
 func analysePhoto(connection *websocket.Conn, url string) (result bool, err bool) {
@@ -111,24 +131,24 @@ func analyzePhotos(connection *websocket.Conn, photos []Photo) (result bool, err
 		result, err = analysePhoto(connection, photo.Photo130)
 		if err {
 			return
-		} else if !result {
+		} else if result {
 			return
 		}
 	}
-	return true, false
+	return false, false
 }
 
 func processPost(connection *websocket.Conn, post Post) (err bool) {
 	photos := post.getPhotos()
 	if len(photos) == 0 {
-		setIsBike(post.ID, dbPosts, false)
+		setIsBike(post.ID, false)
 		return false
 	}
 	isBike, connErr := analyzePhotos(connection, photos)
 	if connErr {
 		return true
 	}
-	setIsBike(post.ID, dbPosts, isBike)
+	setIsBike(post.ID, isBike)
 	return false
 }
 
@@ -145,7 +165,7 @@ func waitForRequest(connection *websocket.Conn) (err bool) {
 }
 
 func endProcessPost(connection *websocket.Conn, postID interface{}) (err bool) {
-	fmt.Println("End:", postID)
+	fmt.Println(time.Now().Format(time.UnixDate), "End:", postID)
 	errInfo := connection.WriteMessage(1, []byte("end"))
 
 	if errInfo != nil {
@@ -160,7 +180,7 @@ func work(connection *websocket.Conn) {
 		if waitForRequest(connection) {
 			break
 		}
-		post := getUnprocessedPost(dbPosts)
+		post := getUnprocessedPost()
 		if processPost(connection, post) {
 			break
 		}
@@ -204,7 +224,7 @@ func connectMongo(mongoURL string) *mongo.Client {
 func main() {
 	conf := initConfig("config.json")
 	db := connectMongo(conf.MongoURL)
-	dbPosts = db.Database("big_data").Collection("posts")
+	dbPosts.collection = db.Database("big_data").Collection("posts")
 	defer db.Disconnect(context.TODO())
 	http.HandleFunc("/", server)
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
